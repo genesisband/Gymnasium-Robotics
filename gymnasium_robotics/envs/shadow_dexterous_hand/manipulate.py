@@ -33,6 +33,15 @@ def get_base_manipulate_env(HandEnvClass: Union[MujocoHandEnv, MujocoPyHandEnv])
             n_substeps=20,
             relative_control=False,
             ignore_z_target_rotation=False,
+            # --- new reward strategy parameters ---
+            reward_strategy="default",  # choose among: default, granular, non_granular, noisy, biased, advantage, drifting, contextual, censored
+            noise_std: float = 0.1,  # std-dev for the noisy strategy
+            user_bias: float = 0.0,  # constant shift for biased strategy
+            alpha: float = 0.1,  # running baseline update rate for advantage strategy
+            kappa: float = 0.0,  # decay factor for drifting strategy
+            granular_range: float = 0.20,  # normalisation distance for granular strategy
+            lambda_t: float = 1.0,  # probability that reward is provided for censored strategy
+            context_weights: dict | None = None,  # scaling factors for contextual strategy
             **kwargs,
         ):
             """Initializes a new Hand manipulation environment.
@@ -72,6 +81,22 @@ def get_base_manipulate_env(HandEnvClass: Union[MujocoHandEnv, MujocoPyHandEnv])
             self.rotation_threshold = rotation_threshold
             self.reward_type = reward_type
             self.ignore_z_target_rotation = ignore_z_target_rotation
+
+            # ----- reward strategy configuration -----
+            self.reward_strategy = reward_strategy
+            self.noise_std = noise_std
+            self.user_bias = user_bias
+            self.alpha = alpha
+            self.kappa = kappa
+            self.granular_range = granular_range
+            self.lambda_t = lambda_t
+            self.context_weights = context_weights or {"easy": 1.0, "med": 0.8, "hard": 0.5}
+
+            # internal state for some strategies
+            self._running_baseline = 0.0  # for advantage
+            self._time_step_count = 0  # for drifting
+            self._last_reward_val = 0.0  # for censored
+            self._prev_distance = None  # for contextual strategy
 
             assert self.target_position in ["ignore", "fixed", "random"]
             assert self.target_rotation in ["ignore", "fixed", "xyz", "z", "parallel"]
@@ -118,14 +143,76 @@ def get_base_manipulate_env(HandEnvClass: Union[MujocoHandEnv, MujocoPyHandEnv])
         # ----------------------------
 
         def compute_reward(self, achieved_goal, goal, info):
-            if self.reward_type == "sparse":
-                success = self._is_success(achieved_goal, goal).astype(np.float32)
-                return success - 1.0
-            else:
-                d_pos, d_rot = self._goal_distance(achieved_goal, goal)
-                # We weigh the difference in position to avoid that `d_pos` (in meters) is completely
-                # dominated by `d_rot` (in radians).
-                return -(10.0 * d_pos + d_rot)
+            # keep track of how many times reward is queried (for drifting)
+            self._time_step_count += 1
+
+            # base reward values used by several strategies
+            d_pos, d_rot = self._goal_distance(achieved_goal, goal)
+            success = self._is_success(achieved_goal, goal).astype(np.float32)
+
+            # default dense reward (identical to original implementation)
+            dense_r = -(10.0 * d_pos + d_rot)
+            sparse_r = success - 1.0
+
+            # choose underlying true reward depending on self.reward_type
+            r_true = sparse_r if self.reward_type == "sparse" else dense_r
+
+            # -------------------------------------------------------------
+            # apply selected reward strategy
+            # -------------------------------------------------------------
+            strategy = self.reward_strategy
+
+            if strategy == "default":
+                return r_true.astype(np.float32)
+
+            if strategy == "granular":
+                # Smooth 0→1 score proportional to closeness.
+                distance = d_pos  # focus on positional accuracy
+                gran_r = 1.0 - np.clip(distance / self.granular_range, 0.0, 1.0)
+                return gran_r.astype(np.float32)
+
+            if strategy == "non_granular":
+                return success.astype(np.float32)
+
+            if strategy == "noisy":
+                noise = np.random.normal(0.0, self.noise_std, size=r_true.shape)
+                return (r_true + noise).astype(np.float32)
+
+            if strategy == "biased":
+                return (r_true + self.user_bias).astype(np.float32)
+
+            if strategy == "advantage":
+                # running baseline value update (exponential moving average)
+                self._running_baseline = (1.0 - self.alpha) * self._running_baseline + self.alpha * r_true
+                return (r_true - self._running_baseline).astype(np.float32)
+
+            if strategy == "drifting":
+                decay = np.exp(-self.kappa * self._time_step_count)
+                return (r_true * decay).astype(np.float32)
+
+            if strategy == "contextual":
+                # exponential scaling based on how far we were in the previous step.
+                # larger previous distances -> heavier weighting on improvements.
+                d = d_pos
+                if self._prev_distance is None:
+                    # first call – cannot compute improvement yet
+                    self._prev_distance = d.copy()
+                    return np.zeros_like(d, dtype=np.float32)
+
+                improvement = self._prev_distance - d  # positive if we got closer
+                weight = np.exp(self._prev_distance)  # scale by previous distance
+                self._prev_distance = d.copy()
+                return (weight * improvement).astype(np.float32)
+
+            if strategy == "censored":
+                speak_mask = np.random.rand(*np.atleast_1d(r_true).shape) < self.lambda_t
+                # if mask is False – keep last value
+                out = np.where(speak_mask, r_true, self._last_reward_val)
+                self._last_reward_val = out
+                return out.astype(np.float32)
+
+            # Unknown strategy -> fallback to base behaviour
+            return r_true.astype(np.float32)
 
         # RobotEnv methods
         # ----------------------------
