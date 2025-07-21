@@ -97,6 +97,7 @@ def get_base_manipulate_env(HandEnvClass: Union[MujocoHandEnv, MujocoPyHandEnv])
             self._time_step_count = 0  # for drifting
             self._last_reward_val = 0.0  # for censored
             self._prev_distance = None  # for contextual strategy
+            self._prev_true_reward = None  # for advantage delta strategy
 
             assert self.target_position in ["ignore", "fixed", "random"]
             assert self.target_rotation in ["ignore", "fixed", "xyz", "z", "parallel"]
@@ -182,9 +183,13 @@ def get_base_manipulate_env(HandEnvClass: Union[MujocoHandEnv, MujocoPyHandEnv])
                 return (r_true + self.user_bias).astype(np.float32)
 
             if strategy == "advantage":
-                # running baseline value update (exponential moving average)
-                self._running_baseline = (1.0 - self.alpha) * self._running_baseline + self.alpha * r_true
-                return (r_true - self._running_baseline).astype(np.float32)
+                # Reward is the change in true reward since the last step.
+                if self._prev_true_reward is None:
+                    delta = np.zeros_like(r_true)
+                else:
+                    delta = r_true - self._prev_true_reward
+                self._prev_true_reward = r_true
+                return delta.astype(np.float32)
 
             if strategy == "drifting":
                 decay = np.exp(-self.kappa * self._time_step_count)
